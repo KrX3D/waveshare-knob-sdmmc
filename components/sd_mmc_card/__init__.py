@@ -46,49 +46,63 @@ def _is_idf_root(p):
     return (p / "components" / "fatfs" / "src").is_dir()
 
 
-def _find_idf_root():
-    checked = []
+def _glob_framework(packages_dir):
+    """Return the most recently modified framework-espidf* dir under packages_dir, or None."""
+    packages_dir = Path(packages_dir)
+    if not packages_dir.is_dir():
+        return None
+    candidates = sorted(
+        packages_dir.glob("framework-espidf*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for c in candidates:
+        if _is_idf_root(c):
+            return c
+    return None
 
-    # 1. IDF_PATH env
+
+def _find_idf_root():
+    # 1. IDF_PATH env var
     env_idf = os.environ.get("IDF_PATH")
     if env_idf:
         p = Path(env_idf)
-        checked.append(str(p))
         if _is_idf_root(p):
             _LOGGER.info("sd_mmc_card: IDF root from IDF_PATH: %s", p)
             return p
 
-    # 2. PlatformIO home candidates — covers Docker/HA add-on/pioarduino/native
-    pio_homes = list(filter(None, [
-        os.environ.get("PLATFORMIO_CORE_DIR"),
-        os.path.expanduser("~/.platformio"),
-        "/root/.platformio",
-        "/root/.pio",
-        "/data/.platformio",
-        "/data/.pio",
-        "/data/platformio",
-        "/config/.platformio",
-        "/esphome/.platformio",   # pioarduino may bundle inside the ESPHome image
-        "/usr/local/.platformio",
-        "/home/pi/.platformio",
-        "/home/user/.platformio",
-        "/tmp/.platformio",
+    # 2. Explicit package directories — /data/cache/platformio is the HA
+    #    add-on's actual package storage location (revealed by the tool-esptoolpy
+    #    error: '/data/cache/platformio/packages/tool-esptoolpy')
+    packages_dirs = list(filter(None, [
+        # ── HA add-on specific ──────────────────────────────────────────────
+        "/data/cache/platformio/packages",       # confirmed HA add-on location
+        "/data/cache/packages",
+        "/data/platformio/packages",
+        # ── Standard PlatformIO home locations ─────────────────────────────
+        os.environ.get("PLATFORMIO_PACKAGES_DIR"),
+        os.path.join(os.environ.get("PLATFORMIO_CORE_DIR", ""), "packages") or None,
+        "/root/.platformio/packages",
+        "/root/.pio/packages",
+        "/data/.platformio/packages",
+        "/data/.pio/packages",
+        "/config/.platformio/packages",
+        "/esphome/.platformio/packages",
+        "/usr/local/.platformio/packages",
+        "/home/pi/.platformio/packages",
+        "/home/user/.platformio/packages",
+        "/tmp/.platformio/packages",
     ]))
-    for pio_home in pio_homes:
-        packages_dir = Path(pio_home) / "packages"
-        checked.append(str(packages_dir))
-        if not packages_dir.is_dir():
-            continue
-        for candidate in sorted(
-            packages_dir.glob("framework-espidf*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        ):
-            if _is_idf_root(candidate):
-                _LOGGER.info("sd_mmc_card: IDF root via PIO packages: %s", candidate)
-                return candidate
 
-    # 3. Search ESPHome build tree (works after first PIO run)
+    for pkg_dir in packages_dirs:
+        if not pkg_dir:
+            continue
+        result = _glob_framework(pkg_dir)
+        if result:
+            _LOGGER.info("sd_mmc_card: IDF root via packages dir %s: %s", pkg_dir, result)
+            return result
+
+    # 3. Search the ESPHome build tree (works after first PIO run)
     try:
         for hit in Path(CORE.build_path).rglob("components/fatfs/src"):
             candidate = hit.parent.parent
@@ -98,30 +112,26 @@ def _find_idf_root():
     except Exception as exc:
         _LOGGER.debug("sd_mmc_card: build tree search failed: %s", exc)
 
-    # 4. Full filesystem search — no scoping, searches everywhere
-    #    This WILL find the file regardless of where pioarduino/PIO puts it.
+    # 4. Full filesystem search — last resort
     _LOGGER.warning("sd_mmc_card: trying full filesystem search for esp_vfs_fat.h ...")
     hit = _run(
-        [
-            "find", "/",
-            "-path", "/proc", "-prune", "-o",
-            "-path", "/sys",  "-prune", "-o",
-            "-path", "/dev",  "-prune", "-o",
-            "-name", "esp_vfs_fat.h",
-            "-print", "-quit",
-        ],
+        ["find", "/",
+         "-path", "/proc", "-prune", "-o",
+         "-path", "/sys",  "-prune", "-o",
+         "-path", "/dev",  "-prune", "-o",
+         "-name", "esp_vfs_fat.h", "-print", "-quit"],
         timeout=60,
     )
     if hit:
         try:
             idf_root = Path(hit).parents[4]
             if _is_idf_root(idf_root):
-                _LOGGER.info("sd_mmc_card: IDF root via full filesystem search: %s", idf_root)
+                _LOGGER.info("sd_mmc_card: IDF root via filesystem find: %s", idf_root)
                 return idf_root
         except Exception as exc:
             _LOGGER.debug("sd_mmc_card: could not derive root from %s: %s", hit, exc)
 
-    # --- Total failure: log everything useful for diagnosis ---
+    # Diagnostics on total failure
     def _ls(p):
         try:
             return [str(x) for x in Path(p).iterdir()]
@@ -130,33 +140,28 @@ def _find_idf_root():
 
     _LOGGER.error(
         "\n=== sd_mmc_card: COULD NOT LOCATE ESP-IDF ===\n"
-        "  esp_vfs_fat.h was not found anywhere on the filesystem.\n"
-        "  This means the framework-espidf package has not been downloaded yet.\n"
-        "  Run the ESPHome build once more — PlatformIO will download the\n"
-        "  framework during the compile phase and the next code-gen run will\n"
-        "  find it.\n\n"
         "  Diagnostic info:\n"
-        "    IDF_PATH env            = %s\n"
-        "    PLATFORMIO_CORE_DIR env = %s\n"
-        "    HOME env                = %s\n"
-        "    CORE.build_path         = %s\n"
-        "    which pio               = %s\n"
-        "    full find result        = %s\n"
-        "    /root contents          = %s\n"
-        "    /data contents          = %s\n"
-        "    /esphome contents       = %s\n"
-        "    searched PIO paths      = %s\n"
+        "    IDF_PATH env              = %s\n"
+        "    PLATFORMIO_CORE_DIR env   = %s\n"
+        "    PLATFORMIO_PACKAGES_DIR   = %s\n"
+        "    HOME env                  = %s\n"
+        "    CORE.build_path           = %s\n"
+        "    full find result          = %s\n"
+        "    /data contents            = %s\n"
+        "    /data/cache contents      = %s\n"
+        "    /root contents            = %s\n"
+        "    which pio                 = %s\n"
         "==============================================",
         os.environ.get("IDF_PATH", "not set"),
         os.environ.get("PLATFORMIO_CORE_DIR", "not set"),
+        os.environ.get("PLATFORMIO_PACKAGES_DIR", "not set"),
         os.environ.get("HOME", "not set"),
         getattr(CORE, "build_path", "unknown"),
-        _run(["which", "pio"]),
         hit if hit else "not found",
-        _ls("/root"),
         _ls("/data"),
-        _ls("/esphome"),
-        checked,
+        _ls("/data/cache"),
+        _ls("/root"),
+        _run(["which", "pio"]),
     )
     return None
 
@@ -213,5 +218,6 @@ async def to_code(config):
                     cg.add_build_flag(f"-I{full}")
                     added.append(str(full))
             _LOGGER.info("sd_mmc_card: injected %d IDF include paths from %s", len(added), idf_root)
-        # If idf_root is None: no exception — let the compiler error tell the story.
-        # The ERROR log above contains the diagnostics needed to fix it.
+        # If None: diagnostics already logged, compile will fail with the
+        # missing-header error. Add /data/cache/platformio/packages to the
+        # search list above if a new location appears in the diagnostic output.
