@@ -246,3 +246,34 @@ async def to_code(config):
         # included for this TU and the macro is undefined.
         # 512 is the only valid value in IDF 5.x.
         cg.add_build_flag("-DCONFIG_WL_SECTOR_SIZE=512")
+
+        # ── Linker flags ────────────────────────────────────────────────────
+        # ESPHome merges our source into its own IDF component but does not add
+        # fatfs/sdmmc to that component's REQUIRES, so the IDF-compiled .a files
+        # are not included in the final firmware.elf link command.
+        #
+        # PlatformIO (pioarduino) controls the final link step and honours
+        # build_flags for it.  We add -L paths so the linker can find the .a
+        # files, then group them with --start-group/--end-group so circular
+        # references between static libs are resolved correctly.
+        #
+        # The .a files are produced by IDF's CMake during the compile phase,
+        # which completes before the link phase — so the paths exist when the
+        # linker runs even if they don't yet exist during this code-gen step.
+        #
+        # Path: {build_path}/.pioenvs/{device_name}/esp-idf/{component}/lib{component}.a
+        device_name = Path(CORE.build_path).name
+        idf_libs_base = Path(CORE.build_path) / ".pioenvs" / device_name / "esp-idf"
+
+        # fatfs            → f_* functions, esp_vfs_fat_sdmmc_mount, esp_vfs_fat_sdcard_format
+        # esp_driver_sdmmc → SDMMC host driver (IDF 5+)
+        # sdmmc            → SDMMC protocol layer (sdmmc_card_t etc.)
+        link_components = ["fatfs", "esp_driver_sdmmc", "sdmmc"]
+
+        for component in link_components:
+            cg.add_build_flag(f"-L{idf_libs_base / component}")
+
+        # Keep flags together and ordered with a single -Wl, string
+        libs = ",".join(f"-l{c}" for c in link_components)
+        cg.add_build_flag(f"-Wl,--start-group,{libs},--end-group")
+        _LOGGER.info("sd_mmc_card: added linker flags for: %s", link_components)
