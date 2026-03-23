@@ -1,6 +1,9 @@
 import os
+import re
 import logging
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import esphome.codegen as cg
@@ -25,20 +28,16 @@ CONF_DATA2_PIN = "data2_pin"
 CONF_DATA3_PIN = "data3_pin"
 CONF_MODE_1BIT = "mode_1bit"
 
-# Headers we need and the subpaths to search for them within the IDF root.
-# Each entry: (header_filename, [candidate subpaths])
-# The first existing subpath wins for each header.
+_IDF_DEPS = ["fatfs", "sdmmc", "esp_driver_sdmmc"]
+
 _REQUIRED_HEADERS = [
     ("esp_vfs_fat.h", [
         "components/fatfs/vfs/include",
-        "components/esp_driver_sdmmc/include",
         "components/vfs/include",
         "components/esp_vfs/include",
-        "components/fat_fileio/include",
     ]),
     ("wear_levelling.h", [
         "components/wear_levelling/include",
-        "components/wear_levelling",
     ]),
     ("ff.h", [
         "components/fatfs/src",
@@ -50,6 +49,7 @@ _REQUIRED_HEADERS = [
     ]),
     ("sdmmc_host.h", [
         "components/esp_driver_sdmmc/include",
+        "components/esp_driver_sdmmc/include/driver",
         "components/driver/include",
         "components/driver/include/driver",
     ]),
@@ -84,31 +84,26 @@ def _glob_framework(packages_dir):
 
 
 def _find_idf_root():
-    # 1. IDF_PATH env var
     env_idf = os.environ.get("IDF_PATH")
     if env_idf:
         p = Path(env_idf)
         if _is_idf_root(p):
             return p
 
-    # 2. Known package directories (HA add-on uses /data/cache/platformio/packages)
-    packages_dirs = list(filter(None, [
+    for pkg_dir in filter(None, [
         "/data/cache/platformio/packages",
         "/data/cache/packages",
-        "/data/platformio/packages",
         os.environ.get("PLATFORMIO_PACKAGES_DIR"),
         "/root/.platformio/packages",
         "/root/.pio/packages",
         "/data/.platformio/packages",
         "/config/.platformio/packages",
         "/usr/local/.platformio/packages",
-    ]))
-    for pkg_dir in packages_dirs:
+    ]):
         result = _glob_framework(pkg_dir)
         if result:
             return result
 
-    # 3. Build tree
     try:
         for hit in Path(CORE.build_path).rglob("components/fatfs"):
             candidate = hit.parent
@@ -117,34 +112,20 @@ def _find_idf_root():
     except Exception:
         pass
 
-    # 4. Filesystem search
-    hit = _run(
-        ["find", "/",
-         "-path", "/proc", "-prune", "-o",
-         "-path", "/sys", "-prune", "-o",
-         "-path", "/dev", "-prune", "-o",
-         "-name", "esp_vfs_fat.h", "-print", "-quit"],
-        timeout=60,
-    )
+    hit = _run(["find", "/", "-path", "/proc", "-prune", "-o",
+                 "-path", "/sys", "-prune", "-o", "-path", "/dev", "-prune", "-o",
+                 "-name", "esp_vfs_fat.h", "-print", "-quit"], timeout=60)
     if hit:
         try:
-            # walk up until we find the components/ parent
-            p = Path(hit)
-            for parent in p.parents:
+            for parent in Path(hit).parents:
                 if (parent / "components").is_dir() and _is_idf_root(parent):
                     return parent
         except Exception:
             pass
-
     return None
 
 
 def _collect_include_dirs(idf_root):
-    """
-    Walk the IDF root to find the include directories for each required header.
-    Logs exactly which paths are found and which are missing.
-    Returns a list of unique include directories to inject.
-    """
     idf_root = Path(idf_root)
     include_dirs = []
     seen = set()
@@ -161,11 +142,7 @@ def _collect_include_dirs(idf_root):
                 found = True
                 break
         if not found:
-            # Header not found in any candidate — search within the framework
-            result = _run(
-                ["find", str(idf_root), "-name", header, "-print", "-quit"],
-                timeout=30,
-            )
+            result = _run(["find", str(idf_root), "-name", header, "-print", "-quit"], timeout=30)
             if result:
                 actual_dir = Path(result).parent
                 if str(actual_dir) not in seen:
@@ -173,17 +150,90 @@ def _collect_include_dirs(idf_root):
                     include_dirs.append(actual_dir)
                 _LOGGER.info("sd_mmc_card: %-20s → %s (found by search)", header, actual_dir)
             else:
-                _LOGGER.error(
-                    "sd_mmc_card: %s NOT FOUND anywhere under %s — "
-                    "this will cause a compile error. "
-                    "IDF 5.5 may have moved this header. "
-                    "Contents of %s/components: %s",
-                    header, idf_root, idf_root,
-                    [d.name for d in (idf_root / "components").iterdir()
-                     if d.is_dir()][:40],
-                )
+                _LOGGER.error("sd_mmc_card: %s NOT FOUND under %s", header, idf_root)
 
     return include_dirs
+
+
+# ── CMakeLists.txt patch (background thread) ─────────────────────────────────
+#
+# ESPHome 2026.3.0 does not expose cg.add_idf_component_dependency or any
+# equivalent API that adds entries to the REQUIRES list of the generated
+# src/CMakeLists.txt.  Without fatfs/sdmmc/esp_driver_sdmmc in that list the
+# linker cannot find esp_vfs_fat_sdmmc_mount, f_getfree, f_opendir etc.
+#
+# The generated src/CMakeLists.txt is written by ESPHome AFTER all to_code
+# coroutines complete, and is read by CMake during the PlatformIO/pioarduino
+# build that starts afterwards.  We exploit this window by starting a thread
+# that polls for the file, patches the REQUIRES list, and exits before CMake
+# reads it.
+#
+# This does NOT affect the bootloader because the bootloader uses a completely
+# separate CMakeLists.txt (under .pioenvs/<dev>/esp-idf/bootloader/) that is
+# unrelated to the main src/CMakeLists.txt we patch.
+
+def _patch_cmake_requires(cmake_path: Path, deps: list):
+    """
+    Wait for cmake_path to be written, then insert deps into the
+    idf_component_register REQUIRES block.  Runs in a daemon thread.
+    """
+    deadline = time.monotonic() + 120  # wait up to 2 minutes
+
+    while time.monotonic() < deadline:
+        time.sleep(0.15)
+
+        if not cmake_path.exists():
+            continue
+
+        try:
+            content = cmake_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        # Wait until the file is fully written (must contain the register call)
+        if "idf_component_register" not in content:
+            continue
+
+        # Check if we even need to patch
+        missing = [d for d in deps if d not in content]
+        if not missing:
+            _LOGGER.debug("sd_mmc_card: CMakeLists.txt already contains all deps, no patch needed")
+            return
+
+        # Insert missing deps at the start of the REQUIRES block.
+        # Handles two common formats:
+        #   REQUIRES\n        dep1\n        dep2
+        #   REQUIRES dep1 dep2
+        insert = "\n        ".join(missing)
+        patched, n = re.subn(
+            r'(\bREQUIRES\b)',
+            f'REQUIRES\n        {insert}',
+            content,
+            count=1,
+        )
+        if n == 0:
+            # No REQUIRES block found — add one before the closing paren
+            patched = content.replace(
+                "idf_component_register(",
+                f"idf_component_register(\n    REQUIRES\n        {insert}",
+                1,
+            )
+
+        try:
+            cmake_path.write_text(patched, encoding="utf-8")
+            _LOGGER.info(
+                "sd_mmc_card: patched %s — added REQUIRES: %s", cmake_path, missing
+            )
+            return
+        except OSError as exc:
+            _LOGGER.warning("sd_mmc_card: could not write %s: %s", cmake_path, exc)
+            return
+
+    _LOGGER.error(
+        "sd_mmc_card: timed out waiting for %s — linker will likely fail "
+        "with undefined refs to f_getfree / esp_vfs_fat_sdmmc_mount etc.",
+        cmake_path,
+    )
 
 
 def _validate_pins(config):
@@ -229,71 +279,64 @@ async def to_code(config):
         cg.add(var.set_data3_pin(config[CONF_DATA3_PIN]))
 
     if CORE.is_esp32:
-        # ── Include paths ────────────────────────────────────────────────────
+        # ── 1. Compiler include paths ────────────────────────────────────────
         idf_root = _find_idf_root()
         if idf_root is None:
             _LOGGER.error("sd_mmc_card: could not locate ESP-IDF root")
             return
 
         _LOGGER.info("sd_mmc_card: IDF root = %s", idf_root)
-        include_dirs = _collect_include_dirs(idf_root)
-        for d in include_dirs:
+        for d in _collect_include_dirs(idf_root):
             cg.add_build_flag(f"-I{d}")
-        _LOGGER.info("sd_mmc_card: injected %d include paths", len(include_dirs))
 
-        # ffconf.h references CONFIG_WL_SECTOR_SIZE from the IDF wear_levelling
-        # Kconfig. Without the normal IDF component chain this macro is undefined.
+        # ffconf.h references CONFIG_WL_SECTOR_SIZE from wear_levelling Kconfig.
         # 512 is the only valid value in IDF 5.x.
         cg.add_build_flag("-DCONFIG_WL_SECTOR_SIZE=512")
 
-        # ── Linker: IDF component dependencies ──────────────────────────────
-        # ESPHome's own built-in components (e.g. mdns) use cg.add_idf_component_dependency
-        # to tell ESPHome's IDF CMakeLists.txt generator to add a component to
-        # the REQUIRES list — which is what causes the IDF build system to link
-        # the component's .a file into firmware.elf (and NOT into the bootloader,
-        # since the bootloader is a separate CMake sub-project).
-        #
-        # DO NOT use cg.add_build_flag with -lfatfs etc. — build_flags maps to
-        # CMAKE_EXE_LINKER_FLAGS which propagates to the bootloader linker and
-        # causes "cannot find -lfatfs" because the bootloader doesn't build fatfs.
-        idf_deps = ["fatfs", "sdmmc", "esp_driver_sdmmc"]
+        # ── 2. Linker: try ESPHome's built-in API first ──────────────────────
+        # Print available IDF-related attrs for diagnostics on first run.
+        idf_attrs = [a for a in dir(cg) if "idf" in a.lower() or "require" in a.lower()]
+        _LOGGER.debug("sd_mmc_card: cg IDF-related attributes: %s", idf_attrs)
 
-        added_via = None
+        linked = False
+        for fn_name in [
+            "add_idf_component_dependency",   # ESPHome 2022-2025
+            "add_idf_sdk_component",
+            "add_esp_idf_component",
+        ]:
+            fn = getattr(cg, fn_name, None)
+            if fn is not None:
+                for dep in _IDF_DEPS:
+                    fn(dep)
+                _LOGGER.info("sd_mmc_card: registered IDF deps via cg.%s: %s", fn_name, _IDF_DEPS)
+                linked = True
+                break
 
-        # Strategy 1: cg.add_idf_component_dependency (ESPHome 2024+, same API
-        #             used by the built-in mdns, bluetooth, etc. components)
-        if hasattr(cg, "add_idf_component_dependency"):
-            for dep in idf_deps:
-                cg.add_idf_component_dependency(dep)
-            added_via = "cg.add_idf_component_dependency"
-
-        # Strategy 2: esphome.components.esp32.add_idf_component_dependency
-        #             (older ESPHome versions, same effect)
-        elif not added_via:
+        if not linked:
             try:
-                from esphome.components.esp32 import add_idf_component_dependency as _add_dep
-                for dep in idf_deps:
-                    _add_dep(dep)
-                added_via = "esphome.components.esp32.add_idf_component_dependency"
+                from esphome.components.esp32 import add_idf_component_dependency as _add
+                for dep in _IDF_DEPS:
+                    _add(dep)
+                _LOGGER.info("sd_mmc_card: registered IDF deps via esp32 module: %s", _IDF_DEPS)
+                linked = True
             except (ImportError, AttributeError):
                 pass
 
-        if added_via:
-            _LOGGER.info(
-                "sd_mmc_card: registered IDF deps %s via %s", idf_deps, added_via
+        if not linked:
+            # ── 3. Fallback: patch src/CMakeLists.txt in a background thread ─
+            # ESPHome writes this file after all to_code coroutines finish.
+            # PlatformIO/CMake reads it when the compile subprocess starts.
+            # The patch thread exploits the time window between those two events.
+            cmake_path = Path(CORE.build_path) / "src" / "CMakeLists.txt"
+            _LOGGER.warning(
+                "sd_mmc_card: no ESPHome API available to add IDF component deps. "
+                "Falling back to CMakeLists.txt patch thread targeting %s",
+                cmake_path,
             )
-        else:
-            _LOGGER.error(
-                "sd_mmc_card: NEITHER cg.add_idf_component_dependency NOR "
-                "esphome.components.esp32.add_idf_component_dependency is available.\n"
-                "  The firmware will fail to link (undefined refs to f_getfree,\n"
-                "  esp_vfs_fat_sdmmc_mount, etc.).\n"
-                "  Workaround: add the following to your device YAML:\n"
-                "    esp32:\n"
-                "      framework:\n"
-                "        type: esp-idf\n"
-                "        advanced:\n"
-                "          ignore_efuse_mac_crc: false  # forces a fresh CMake run\n"
-                "  Then file a bug at https://github.com/KrX3D/waveshare-knob-sdmmc\n"
-                "  with your ESPHome version number."
+            t = threading.Thread(
+                target=_patch_cmake_requires,
+                args=(cmake_path, _IDF_DEPS),
+                daemon=True,
+                name="sd_mmc_cmake_patch",
             )
+            t.start()
