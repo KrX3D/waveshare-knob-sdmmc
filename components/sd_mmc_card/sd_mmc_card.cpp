@@ -39,8 +39,6 @@ void SdMmcCard::setup() {
     mark_failed();
     return;
   }
-
-  // Publish initial sensor values
   update_sensors_();
 }
 
@@ -100,10 +98,18 @@ void SdMmcCard::update_card_info_() {
     card_freq_khz_ = 0;
     return;
   }
-  switch (card_->ocr & SD_OCR_SDHC_CAP) {
-    case 0: card_type_ = CardType::SDSC; break;
-    default: card_type_ = CardType::SDHC; break;
+
+  // FIX: Properly detect MMC, SDSC, SDHC, and SDXC
+  if (card_->is_mmc) {
+    card_type_ = CardType::MMC;
+  } else if (card_->ocr & SD_OCR_SDHC_CAP) {
+    // SDXC threshold is > 32 GB; card_->csd.capacity is in 512-byte sectors
+    uint64_t capacity_bytes = (uint64_t) card_->csd.capacity * 512ULL;
+    card_type_ = (capacity_bytes > 32ULL * 1024 * 1024 * 1024) ? CardType::SDXC : CardType::SDHC;
+  } else {
+    card_type_ = CardType::SDSC;
   }
+
   card_freq_khz_ = card_->max_freq_khz;
 }
 
@@ -112,7 +118,7 @@ void SdMmcCard::dump_config() {
   ESP_LOGCONFIG(TAG, "  Mount: %s", MOUNT_POINT);
   ESP_LOGCONFIG(TAG, "  Mode: %s-bit", mode_1bit_ ? "1" : "4");
   ESP_LOGCONFIG(TAG, "  Card Type: %s", card_type_string_().c_str());
-  ESP_LOGCONFIG(TAG, "  Frequency: %d kHz", card_freq_khz_);
+  ESP_LOGCONFIG(TAG, "  Frequency (max): %d kHz", card_freq_khz_);
   ESP_LOGCONFIG(TAG, "  Filesystem: %s", fs_type_string_().c_str());
   ESP_LOGCONFIG(TAG, "  Sensors: total=%s used=%s free=%s freq=%s file_size=%s",
                 total_space_sensor_ ? "on" : "off",
@@ -127,31 +133,33 @@ void SdMmcCard::dump_config() {
 }
 
 void SdMmcCard::loop() {
-  // Update sensors periodically
-  static uint32_t last_update = 0;
+  // FIX: Use member variable instead of static — safe for multiple instances
   uint32_t now = millis();
-  if (now - last_update > 60000) {  // Update every 60 seconds
+  if (now - last_update_ > 60000) {
     update_sensors_();
-    last_update = now;
+    last_update_ = now;
   }
 }
 
 void SdMmcCard::update_sensors_() {
+  // FIX: Guard against being called when card is not mounted (e.g. after failed setup)
+  if (card_ == nullptr) return;
+
   if (total_space_sensor_)
     total_space_sensor_->publish_state(total_space());
-  
+
   if (used_space_sensor_)
     used_space_sensor_->publish_state(used_space());
-  
+
   if (free_space_sensor_)
     free_space_sensor_->publish_state(free_space());
 
   if (frequency_sensor_)
     frequency_sensor_->publish_state(card_freq_khz_);
-  
+
   if (file_size_sensor_ && !file_size_path_.empty())
     file_size_sensor_->publish_state(file_size(file_size_path_));
-  
+
   if (card_type_sensor_)
     card_type_sensor_->publish_state(card_type_string_());
 
@@ -161,17 +169,17 @@ void SdMmcCard::update_sensors_() {
 
 std::string SdMmcCard::card_type_string_() {
   switch (card_type_) {
-    case CardType::MMC: return "MMC";
+    case CardType::MMC:  return "MMC";
     case CardType::SDSC: return "SDSC";
     case CardType::SDHC: return "SDHC";
     case CardType::SDXC: return "SDXC";
-    default: return "UNKNOWN";
+    default:             return "UNKNOWN";
   }
 }
 
 std::string SdMmcCard::fs_type_string_() {
-  FATFS *fs;
-  DWORD free_clust;
+  FATFS *fs = nullptr;
+  DWORD free_clust = 0;
   FRESULT result = f_getfree(FATFS_ROOT, &free_clust, &fs);
   if (result != FR_OK || fs == nullptr)
     return "UNKNOWN";
@@ -190,7 +198,8 @@ std::string SdMmcCard::fs_type_string_() {
 /* ---------- file ops ---------- */
 
 bool SdMmcCard::write_file(const std::string &path, const std::string &data) {
-  FILE *f = fopen((std::string(MOUNT_POINT) + path).c_str(), "w");
+  // FIX: Use binary mode ("wb") to avoid text-mode line-ending translation
+  FILE *f = fopen((std::string(MOUNT_POINT) + path).c_str(), "wb");
   if (!f) {
     ESP_LOGE(TAG, "Write failed to open %s (errno: %d)", path.c_str(), errno);
     return false;
@@ -198,16 +207,16 @@ bool SdMmcCard::write_file(const std::string &path, const std::string &data) {
   fwrite(data.data(), 1, data.size(), f);
   fclose(f);
   ESP_LOGI(TAG, "Wrote %u bytes to %s", static_cast<unsigned>(data.size()), path.c_str());
-  
-  // Update file size sensor if monitoring this file
+
   if (file_size_sensor_ && file_size_path_ == path)
     file_size_sensor_->publish_state(file_size(path));
-  
+
   return true;
 }
 
 bool SdMmcCard::append_file(const std::string &path, const std::string &data) {
-  FILE *f = fopen((std::string(MOUNT_POINT) + path).c_str(), "a");
+  // FIX: Use binary mode ("ab") to avoid text-mode line-ending translation
+  FILE *f = fopen((std::string(MOUNT_POINT) + path).c_str(), "ab");
   if (!f) {
     ESP_LOGE(TAG, "Append failed to open %s (errno: %d)", path.c_str(), errno);
     return false;
@@ -215,29 +224,40 @@ bool SdMmcCard::append_file(const std::string &path, const std::string &data) {
   fwrite(data.data(), 1, data.size(), f);
   fclose(f);
   ESP_LOGI(TAG, "Appended %u bytes to %s", static_cast<unsigned>(data.size()), path.c_str());
-  
-  // Update file size sensor if monitoring this file
+
   if (file_size_sensor_ && file_size_path_ == path)
     file_size_sensor_->publish_state(file_size(path));
-  
+
   return true;
 }
 
 bool SdMmcCard::read_file(const std::string &path, std::string &out) {
-  FILE *f = fopen((std::string(MOUNT_POINT) + path).c_str(), "r");
+  // FIX: Use binary mode + fread for full file content (handles binary data,
+  //      null bytes, and avoids fgets newline quirks)
+  FILE *f = fopen((std::string(MOUNT_POINT) + path).c_str(), "rb");
   if (!f) {
     ESP_LOGE(TAG, "Read failed to open %s (errno: %d)", path.c_str(), errno);
     return false;
   }
-  char buf[256];
+
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  rewind(f);
+
   out.clear();
-  size_t total_read = 0;
-  while (fgets(buf, sizeof(buf), f)) {
-    total_read += strlen(buf);
-    out += buf;
+  if (sz > 0) {
+    // Guard against unexpectedly large files consuming all heap
+    if (sz > 65536) {
+      ESP_LOGW(TAG, "File %s is %ld bytes — reading only first 65536", path.c_str(), sz);
+      sz = 65536;
+    }
+    out.resize(sz);
+    size_t read = fread(&out[0], 1, sz, f);
+    out.resize(read);  // trim if fread read less than expected
+    ESP_LOGI(TAG, "Read %u bytes from %s", static_cast<unsigned>(read), path.c_str());
   }
+
   fclose(f);
-  ESP_LOGI(TAG, "Read %u bytes from %s", static_cast<unsigned>(total_read), path.c_str());
   return true;
 }
 
@@ -249,15 +269,33 @@ bool SdMmcCard::delete_file(const std::string &path) {
   } else {
     ESP_LOGE(TAG, "Failed to delete file %s (fatfs err: %d)", path.c_str(), result);
   }
-  
-  // Update file size sensor if monitoring this file
+
   if (removed && file_size_sensor_ && file_size_path_ == path)
     file_size_sensor_->publish_state(0);
-  
+
   return removed;
 }
 
 bool SdMmcCard::format_card() {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  // FIX: On IDF 5.x, esp_vfs_fat_sdcard_unmount deinitialises the SDMMC host,
+  //      so f_mkfs would have no physical access. Use the IDF 5 built-in
+  //      format helper that keeps the host alive.
+  if (card_ == nullptr) {
+    ESP_LOGE(TAG, "Format failed: card is not mounted");
+    return false;
+  }
+  esp_err_t err = esp_vfs_fat_sdcard_format(MOUNT_POINT, card_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Format failed: %s", esp_err_to_name(err));
+    return false;
+  }
+  ESP_LOGW(TAG, "Formatted card via esp_vfs_fat_sdcard_format");
+  update_card_info_();
+  update_sensors_();
+  return true;
+#else
+  // IDF < 5: unmount first, then use f_mkfs directly (host stays alive)
   if (!this->unmount_card_()) {
     return false;
   }
@@ -276,6 +314,7 @@ bool SdMmcCard::format_card() {
   }
   ESP_LOGE(TAG, "Failed to format card at %s (fatfs err: %d)", FATFS_ROOT, result);
   return false;
+#endif
 }
 
 bool SdMmcCard::remount_card() {
@@ -332,8 +371,9 @@ size_t SdMmcCard::file_size(const std::string &path) {
 std::vector<std::string> SdMmcCard::list_directory(const std::string &path, uint8_t depth) {
   std::vector<FileInfo> file_infos;
   scan_dir_(path, depth, file_infos);
-  
+
   std::vector<std::string> result;
+  result.reserve(file_infos.size());
   for (const auto &info : file_infos) {
     result.push_back(info.path);
   }
@@ -352,7 +392,7 @@ std::vector<FileInfo> SdMmcCard::list_directory_file_info(const std::string &pat
 
 void SdMmcCard::scan_dir_(const std::string &path, uint8_t depth, std::vector<FileInfo> &out) {
   if (depth == 0) return;
-  
+
   std::string full_path = fatfs_path_(path);
   ESP_LOGD(TAG, "Scanning directory: %s", full_path.c_str());
 
@@ -371,7 +411,7 @@ void SdMmcCard::scan_dir_(const std::string &path, uint8_t depth, std::vector<Fi
       break;
     if (strcmp(file_info.fname, ".") == 0 || strcmp(file_info.fname, "..") == 0)
       continue;
-    
+
     count++;
     std::string entry_path = path;
     if (!entry_path.empty() && entry_path.back() != kFatfsSeparator)
@@ -394,17 +434,34 @@ void SdMmcCard::scan_dir_(const std::string &path, uint8_t depth, std::vector<Fi
 /* ---------- space ---------- */
 
 uint64_t SdMmcCard::total_space() {
-  FATFS *fs;
-  DWORD free_clust;
-  f_getfree("0:", &free_clust, &fs);
-  return (uint64_t) fs->n_fatent * fs->csize * 512;
+  FATFS *fs = nullptr;
+  DWORD free_clust = 0;
+  if (f_getfree(FATFS_ROOT, &free_clust, &fs) != FR_OK || fs == nullptr) {
+    ESP_LOGE(TAG, "total_space: f_getfree failed");
+    return 0;
+  }
+  // fs->ssize only exists when FF_MAX_SS != FF_MIN_SS (variable sector size).
+  // IDF 5.x FatFS uses fixed 512-byte sectors (FF_MIN_SS == FF_MAX_SS == 512),
+  // so the ssize field is not present in the FATFS struct.
+#if FF_MAX_SS != FF_MIN_SS
+  return (uint64_t) fs->n_fatent * fs->csize * fs->ssize;
+#else
+  return (uint64_t) fs->n_fatent * fs->csize * FF_MIN_SS;
+#endif
 }
 
 uint64_t SdMmcCard::free_space() {
-  FATFS *fs;
-  DWORD free_clust;
-  f_getfree("0:", &free_clust, &fs);
-  return (uint64_t) free_clust * fs->csize * 512;
+  FATFS *fs = nullptr;
+  DWORD free_clust = 0;
+  if (f_getfree(FATFS_ROOT, &free_clust, &fs) != FR_OK || fs == nullptr) {
+    ESP_LOGE(TAG, "free_space: f_getfree failed");
+    return 0;
+  }
+#if FF_MAX_SS != FF_MIN_SS
+  return (uint64_t) free_clust * fs->csize * fs->ssize;
+#else
+  return (uint64_t) free_clust * fs->csize * FF_MIN_SS;
+#endif
 }
 
 uint64_t SdMmcCard::used_space() {
