@@ -239,3 +239,10 @@ async def to_code(config):
         for d in include_dirs:
             cg.add_build_flag(f"-I{d}")
         _LOGGER.info("sd_mmc_card: injected %d include paths", len(include_dirs))
+
+        # ffconf.h (pulled in via ff.h → esp_vfs_fat.h) references CONFIG_WL_SECTOR_SIZE
+        # from the IDF wear_levelling Kconfig. When headers are injected outside the
+        # normal IDF component dependency chain, sdkconfig.h is not automatically
+        # included for this TU and the macro is undefined.
+        # 512 is the only valid value in IDF 5.x.
+        cg.add_build_flag("-DCONFIG_WL_SECTOR_SIZE=512")
