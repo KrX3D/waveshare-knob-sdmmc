@@ -229,9 +229,10 @@ async def to_code(config):
         cg.add(var.set_data3_pin(config[CONF_DATA3_PIN]))
 
     if CORE.is_esp32:
+        # ── Include paths ────────────────────────────────────────────────────
         idf_root = _find_idf_root()
         if idf_root is None:
-            _LOGGER.error("sd_mmc_card: could not locate ESP-IDF root at all")
+            _LOGGER.error("sd_mmc_card: could not locate ESP-IDF root")
             return
 
         _LOGGER.info("sd_mmc_card: IDF root = %s", idf_root)
@@ -240,40 +241,38 @@ async def to_code(config):
             cg.add_build_flag(f"-I{d}")
         _LOGGER.info("sd_mmc_card: injected %d include paths", len(include_dirs))
 
-        # ffconf.h (pulled in via ff.h → esp_vfs_fat.h) references CONFIG_WL_SECTOR_SIZE
-        # from the IDF wear_levelling Kconfig. When headers are injected outside the
-        # normal IDF component dependency chain, sdkconfig.h is not automatically
-        # included for this TU and the macro is undefined.
-        # 512 is the only valid value in IDF 5.x.
+        # ffconf.h references CONFIG_WL_SECTOR_SIZE from the IDF wear_levelling
+        # Kconfig.  When headers are injected outside the normal IDF component
+        # dependency chain this macro is undefined.  512 is the only valid value
+        # in IDF 5.x.
         cg.add_build_flag("-DCONFIG_WL_SECTOR_SIZE=512")
 
-        # ── Linker flags ────────────────────────────────────────────────────
-        # ESPHome merges our source into its own IDF component but does not add
-        # fatfs/sdmmc to that component's REQUIRES, so the IDF-compiled .a files
-        # are not included in the final firmware.elf link command.
+        # ── Linker: IDF component dependencies ──────────────────────────────
+        # The correct way to link IDF component libraries is to add them to the
+        # REQUIRES list in the generated src/CMakeLists.txt.  ESPHome exposes
+        # this through esphome.components.esp32.add_idf_component_dependency().
         #
-        # PlatformIO (pioarduino) controls the final link step and honours
-        # build_flags for it.  We add -L paths so the linker can find the .a
-        # files, then group them with --start-group/--end-group so circular
-        # references between static libs are resolved correctly.
-        #
-        # The .a files are produced by IDF's CMake during the compile phase,
-        # which completes before the link phase — so the paths exist when the
-        # linker runs even if they don't yet exist during this code-gen step.
-        #
-        # Path: {build_path}/.pioenvs/{device_name}/esp-idf/{component}/lib{component}.a
-        device_name = Path(CORE.build_path).name
-        idf_libs_base = Path(CORE.build_path) / ".pioenvs" / device_name / "esp-idf"
-
-        # fatfs            → f_* functions, esp_vfs_fat_sdmmc_mount, esp_vfs_fat_sdcard_format
-        # esp_driver_sdmmc → SDMMC host driver (IDF 5+)
-        # sdmmc            → SDMMC protocol layer (sdmmc_card_t etc.)
-        link_components = ["fatfs", "esp_driver_sdmmc", "sdmmc"]
-
-        for component in link_components:
-            cg.add_build_flag(f"-L{idf_libs_base / component}")
-
-        # Keep flags together and ordered with a single -Wl, string
-        libs = ",".join(f"-l{c}" for c in link_components)
-        cg.add_build_flag(f"-Wl,--start-group,{libs},--end-group")
-        _LOGGER.info("sd_mmc_card: added linker flags for: %s", link_components)
+        # Using build_flags for -lfatfs etc. is WRONG because build_flags maps
+        # to CMAKE_EXE_LINKER_FLAGS which CMake propagates to ALL executable
+        # targets including the bootloader — which does not build fatfs and
+        # therefore fails to link.
+        idf_deps = ["fatfs", "sdmmc", "esp_driver_sdmmc"]
+        try:
+            from esphome.components.esp32 import add_idf_component_dependency
+            for dep in idf_deps:
+                add_idf_component_dependency(dep)
+            _LOGGER.info("sd_mmc_card: registered IDF component deps via esp32 module: %s", idf_deps)
+        except (ImportError, AttributeError) as exc:
+            _LOGGER.error(
+                "sd_mmc_card: could not register IDF component deps (%s).\n"
+                "  The component will fail to link (undefined references to\n"
+                "  esp_vfs_fat_sdmmc_mount, f_getfree, f_opendir, etc.).\n"
+                "  As a workaround add this to your ESPHome device YAML:\n"
+                "    esp32:\n"
+                "      framework:\n"
+                "        type: esp-idf\n"
+                "        # already present — just add under it:\n"
+                "    # (no workaround available without ESPHome esp32 module support)\n"
+                "  ESPHome version may be too old. Reported error: %s",
+                exc, exc,
+            )
