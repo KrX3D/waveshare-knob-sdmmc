@@ -200,24 +200,35 @@ def _patch_cmake_requires(cmake_path: Path, deps: list):
             _LOGGER.debug("sd_mmc_card: CMakeLists.txt already contains all deps, no patch needed")
             return
 
-        # Insert missing deps at the start of the REQUIRES block.
-        # Handles two common formats:
-        #   REQUIRES\n        dep1\n        dep2
-        #   REQUIRES dep1 dep2
-        insert = "\n        ".join(missing)
-        patched, n = re.subn(
-            r'(\bREQUIRES\b)',
-            f'REQUIRES\n        {insert}',
-            content,
-            count=1,
-        )
-        if n == 0:
-            # No REQUIRES block found — add one before the closing paren
-            patched = content.replace(
-                "idf_component_register(",
-                f"idf_component_register(\n    REQUIRES\n        {insert}",
-                1,
+        deps_str = " ".join(missing)  # space-separated; CMake is whitespace-agnostic
+
+        if re.search(r'\bREQUIRES\b', content):
+            # A REQUIRES block already exists — prepend our deps to it.
+            patched = re.sub(
+                r'\bREQUIRES\b',
+                f'REQUIRES {deps_str}',
+                content,
+                count=1,
             )
+        else:
+            # No REQUIRES block — inject one before the closing ')' of
+            # idf_component_register(…).  A literal newline before and after
+            # the new keyword prevents it merging with adjacent tokens (e.g.
+            # "esp_driver_sdmmcSRCS" when SRCS follows immediately).
+            patched, n = re.subn(
+                r'(idf_component_register\s*\([^)]*)\)',
+                f'\\1\n    REQUIRES {deps_str}\n)',
+                content,
+                count=1,
+                flags=re.DOTALL,
+            )
+            if n == 0:
+                # Last-resort fallback
+                patched = content.replace(
+                    "idf_component_register(",
+                    f"idf_component_register(\n    REQUIRES {deps_str}\n    ",
+                    1,
+                )
 
         try:
             cmake_path.write_text(patched, encoding="utf-8")
