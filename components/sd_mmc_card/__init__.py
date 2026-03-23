@@ -180,9 +180,8 @@ def _patch_cmake_requires(cmake_path: Path, deps: list):
     deadline = time.monotonic() + 120  # wait up to 2 minutes
 
     while time.monotonic() < deadline:
-        time.sleep(0.15)
-
         if not cmake_path.exists():
+            time.sleep(0.15)
             continue
 
         try:
@@ -334,16 +333,28 @@ async def to_code(config):
                 pass
 
         if not linked:
-            # ── 3. Fallback: patch src/CMakeLists.txt in a background thread ─
-            # ESPHome writes this file after all to_code coroutines finish.
-            # PlatformIO/CMake reads it when the compile subprocess starts.
-            # The patch thread exploits the time window between those two events.
+            # ── 3. Fallback: patch src/CMakeLists.txt ───────────────────────
+            # ESPHome keeps the build directory between runs, so the file from
+            # the previous build is usually already present when to_code runs.
+            # We patch it IMMEDIATELY (synchronous) to cover that case, then
+            # also start a thread to re-patch after ESPHome rewrites it for
+            # this build — covering the first-ever build on a clean directory.
             cmake_path = Path(CORE.build_path) / "src" / "CMakeLists.txt"
             _LOGGER.warning(
                 "sd_mmc_card: no ESPHome API available to add IDF component deps. "
-                "Falling back to CMakeLists.txt patch thread targeting %s",
+                "Patching %s (sync now + thread for rewrite).",
                 cmake_path,
             )
+            # Synchronous patch — fixes the cached file CMake will read first
+            if cmake_path.exists():
+                _patch_cmake_requires(cmake_path, _IDF_DEPS)
+            else:
+                _LOGGER.info(
+                    "sd_mmc_card: %s does not exist yet (first build) — "
+                    "thread will patch it after ESPHome writes it.",
+                    cmake_path,
+                )
+            # Thread patch — fixes the file after ESPHome rewrites it this run
             t = threading.Thread(
                 target=_patch_cmake_requires,
                 args=(cmake_path, _IDF_DEPS),
