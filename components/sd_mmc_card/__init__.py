@@ -25,12 +25,30 @@ CONF_DATA2_PIN = "data2_pin"
 CONF_DATA3_PIN = "data3_pin"
 CONF_MODE_1BIT = "mode_1bit"
 
-_IDF_INCLUDE_SUBPATHS = [
-    "components/fatfs/vfs/include",        # esp_vfs_fat.h
-    "components/fatfs/src",                # ff.h, ffconf.h
-    "components/sdmmc/include",            # sdmmc_cmd.h, driver/sdmmc_defs.h
-    "components/esp_driver_sdmmc/include", # driver/sdmmc_host.h  (IDF 5+)
-    "components/driver/include",           # driver/sdmmc_host.h  (IDF 4 compat)
+# Headers we need and the subpaths to search for them within the IDF root.
+# Each entry: (header_filename, [candidate subpaths])
+# The first existing subpath wins for each header.
+_REQUIRED_HEADERS = [
+    ("esp_vfs_fat.h", [
+        "components/fatfs/vfs/include",
+        "components/esp_driver_sdmmc/include",
+        "components/vfs/include",
+        "components/esp_vfs/include",
+        "components/fat_fileio/include",
+    ]),
+    ("ff.h", [
+        "components/fatfs/src",
+        "components/fatfs/include",
+    ]),
+    ("sdmmc_cmd.h", [
+        "components/sdmmc/include",
+        "components/esp_driver_sdmmc/include",
+    ]),
+    ("sdmmc_host.h", [
+        "components/esp_driver_sdmmc/include",
+        "components/driver/include",
+        "components/driver/include/driver",
+    ]),
 ]
 
 
@@ -43,11 +61,10 @@ def _run(cmd, timeout=20):
 
 
 def _is_idf_root(p):
-    return (p / "components" / "fatfs" / "src").is_dir()
+    return (p / "components" / "fatfs").is_dir()
 
 
 def _glob_framework(packages_dir):
-    """Return the most recently modified framework-espidf* dir under packages_dir, or None."""
     packages_dir = Path(packages_dir)
     if not packages_dir.is_dir():
         return None
@@ -68,102 +85,101 @@ def _find_idf_root():
     if env_idf:
         p = Path(env_idf)
         if _is_idf_root(p):
-            _LOGGER.info("sd_mmc_card: IDF root from IDF_PATH: %s", p)
             return p
 
-    # 2. Explicit package directories — /data/cache/platformio is the HA
-    #    add-on's actual package storage location (revealed by the tool-esptoolpy
-    #    error: '/data/cache/platformio/packages/tool-esptoolpy')
+    # 2. Known package directories (HA add-on uses /data/cache/platformio/packages)
     packages_dirs = list(filter(None, [
-        # ── HA add-on specific ──────────────────────────────────────────────
-        "/data/cache/platformio/packages",       # confirmed HA add-on location
+        "/data/cache/platformio/packages",
         "/data/cache/packages",
         "/data/platformio/packages",
-        # ── Standard PlatformIO home locations ─────────────────────────────
         os.environ.get("PLATFORMIO_PACKAGES_DIR"),
-        os.path.join(os.environ.get("PLATFORMIO_CORE_DIR", ""), "packages") or None,
         "/root/.platformio/packages",
         "/root/.pio/packages",
         "/data/.platformio/packages",
-        "/data/.pio/packages",
         "/config/.platformio/packages",
-        "/esphome/.platformio/packages",
         "/usr/local/.platformio/packages",
-        "/home/pi/.platformio/packages",
-        "/home/user/.platformio/packages",
-        "/tmp/.platformio/packages",
     ]))
-
     for pkg_dir in packages_dirs:
-        if not pkg_dir:
-            continue
         result = _glob_framework(pkg_dir)
         if result:
-            _LOGGER.info("sd_mmc_card: IDF root via packages dir %s: %s", pkg_dir, result)
             return result
 
-    # 3. Search the ESPHome build tree (works after first PIO run)
+    # 3. Build tree
     try:
-        for hit in Path(CORE.build_path).rglob("components/fatfs/src"):
-            candidate = hit.parent.parent
+        for hit in Path(CORE.build_path).rglob("components/fatfs"):
+            candidate = hit.parent
             if _is_idf_root(candidate):
-                _LOGGER.info("sd_mmc_card: IDF root via build tree: %s", candidate)
                 return candidate
-    except Exception as exc:
-        _LOGGER.debug("sd_mmc_card: build tree search failed: %s", exc)
+    except Exception:
+        pass
 
-    # 4. Full filesystem search — last resort
-    _LOGGER.warning("sd_mmc_card: trying full filesystem search for esp_vfs_fat.h ...")
+    # 4. Filesystem search
     hit = _run(
         ["find", "/",
          "-path", "/proc", "-prune", "-o",
-         "-path", "/sys",  "-prune", "-o",
-         "-path", "/dev",  "-prune", "-o",
+         "-path", "/sys", "-prune", "-o",
+         "-path", "/dev", "-prune", "-o",
          "-name", "esp_vfs_fat.h", "-print", "-quit"],
         timeout=60,
     )
     if hit:
         try:
-            idf_root = Path(hit).parents[4]
-            if _is_idf_root(idf_root):
-                _LOGGER.info("sd_mmc_card: IDF root via filesystem find: %s", idf_root)
-                return idf_root
-        except Exception as exc:
-            _LOGGER.debug("sd_mmc_card: could not derive root from %s: %s", hit, exc)
-
-    # Diagnostics on total failure
-    def _ls(p):
-        try:
-            return [str(x) for x in Path(p).iterdir()]
+            # walk up until we find the components/ parent
+            p = Path(hit)
+            for parent in p.parents:
+                if (parent / "components").is_dir() and _is_idf_root(parent):
+                    return parent
         except Exception:
-            return f"<error listing {p}>"
+            pass
 
-    _LOGGER.error(
-        "\n=== sd_mmc_card: COULD NOT LOCATE ESP-IDF ===\n"
-        "  Diagnostic info:\n"
-        "    IDF_PATH env              = %s\n"
-        "    PLATFORMIO_CORE_DIR env   = %s\n"
-        "    PLATFORMIO_PACKAGES_DIR   = %s\n"
-        "    HOME env                  = %s\n"
-        "    CORE.build_path           = %s\n"
-        "    full find result          = %s\n"
-        "    /data contents            = %s\n"
-        "    /data/cache contents      = %s\n"
-        "    /root contents            = %s\n"
-        "    which pio                 = %s\n"
-        "==============================================",
-        os.environ.get("IDF_PATH", "not set"),
-        os.environ.get("PLATFORMIO_CORE_DIR", "not set"),
-        os.environ.get("PLATFORMIO_PACKAGES_DIR", "not set"),
-        os.environ.get("HOME", "not set"),
-        getattr(CORE, "build_path", "unknown"),
-        hit if hit else "not found",
-        _ls("/data"),
-        _ls("/data/cache"),
-        _ls("/root"),
-        _run(["which", "pio"]),
-    )
     return None
+
+
+def _collect_include_dirs(idf_root):
+    """
+    Walk the IDF root to find the include directories for each required header.
+    Logs exactly which paths are found and which are missing.
+    Returns a list of unique include directories to inject.
+    """
+    idf_root = Path(idf_root)
+    include_dirs = []
+    seen = set()
+
+    for header, candidates in _REQUIRED_HEADERS:
+        found = False
+        for subpath in candidates:
+            inc_dir = idf_root / subpath
+            if (inc_dir / header).is_file():
+                if str(inc_dir) not in seen:
+                    seen.add(str(inc_dir))
+                    include_dirs.append(inc_dir)
+                _LOGGER.info("sd_mmc_card: %-20s → %s", header, inc_dir)
+                found = True
+                break
+        if not found:
+            # Header not found in any candidate — search within the framework
+            result = _run(
+                ["find", str(idf_root), "-name", header, "-print", "-quit"],
+                timeout=30,
+            )
+            if result:
+                actual_dir = Path(result).parent
+                if str(actual_dir) not in seen:
+                    seen.add(str(actual_dir))
+                    include_dirs.append(actual_dir)
+                _LOGGER.info("sd_mmc_card: %-20s → %s (found by search)", header, actual_dir)
+            else:
+                _LOGGER.error(
+                    "sd_mmc_card: %s NOT FOUND anywhere under %s — "
+                    "this will cause a compile error. "
+                    "IDF 5.5 may have moved this header. "
+                    "Contents of %s/components: %s",
+                    header, idf_root, idf_root,
+                    [d.name for d in (idf_root / "components").iterdir()
+                     if d.is_dir()][:40],
+                )
+
+    return include_dirs
 
 
 def _validate_pins(config):
@@ -210,14 +226,12 @@ async def to_code(config):
 
     if CORE.is_esp32:
         idf_root = _find_idf_root()
-        if idf_root is not None:
-            added = []
-            for subpath in _IDF_INCLUDE_SUBPATHS:
-                full = idf_root / subpath
-                if full.is_dir():
-                    cg.add_build_flag(f"-I{full}")
-                    added.append(str(full))
-            _LOGGER.info("sd_mmc_card: injected %d IDF include paths from %s", len(added), idf_root)
-        # If None: diagnostics already logged, compile will fail with the
-        # missing-header error. Add /data/cache/platformio/packages to the
-        # search list above if a new location appears in the diagnostic output.
+        if idf_root is None:
+            _LOGGER.error("sd_mmc_card: could not locate ESP-IDF root at all")
+            return
+
+        _LOGGER.info("sd_mmc_card: IDF root = %s", idf_root)
+        include_dirs = _collect_include_dirs(idf_root)
+        for d in include_dirs:
+            cg.add_build_flag(f"-I{d}")
+        _LOGGER.info("sd_mmc_card: injected %d include paths", len(include_dirs))
