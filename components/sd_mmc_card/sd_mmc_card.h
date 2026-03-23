@@ -98,9 +98,6 @@ class SdMmcCard : public Component {
   sdmmc_card_t *card_{nullptr};
   uint32_t card_freq_khz_{0};
 
-  // loop timer — per-instance (not static) to support multiple component instances
-  uint32_t last_update_{0};
-
   // sensors
   sensor::Sensor *total_space_sensor_{nullptr};
   sensor::Sensor *used_space_sensor_{nullptr};
