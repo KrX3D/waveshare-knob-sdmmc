@@ -36,6 +36,10 @@ _REQUIRED_HEADERS = [
         "components/esp_vfs/include",
         "components/fat_fileio/include",
     ]),
+    ("wear_levelling.h", [
+        "components/wear_levelling/include",
+        "components/wear_levelling",
+    ]),
     ("ff.h", [
         "components/fatfs/src",
         "components/fatfs/include",
