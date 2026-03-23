@@ -242,37 +242,58 @@ async def to_code(config):
         _LOGGER.info("sd_mmc_card: injected %d include paths", len(include_dirs))
 
         # ffconf.h references CONFIG_WL_SECTOR_SIZE from the IDF wear_levelling
-        # Kconfig.  When headers are injected outside the normal IDF component
-        # dependency chain this macro is undefined.  512 is the only valid value
-        # in IDF 5.x.
+        # Kconfig. Without the normal IDF component chain this macro is undefined.
+        # 512 is the only valid value in IDF 5.x.
         cg.add_build_flag("-DCONFIG_WL_SECTOR_SIZE=512")
 
         # ── Linker: IDF component dependencies ──────────────────────────────
-        # The correct way to link IDF component libraries is to add them to the
-        # REQUIRES list in the generated src/CMakeLists.txt.  ESPHome exposes
-        # this through esphome.components.esp32.add_idf_component_dependency().
+        # ESPHome's own built-in components (e.g. mdns) use cg.add_idf_component_dependency
+        # to tell ESPHome's IDF CMakeLists.txt generator to add a component to
+        # the REQUIRES list — which is what causes the IDF build system to link
+        # the component's .a file into firmware.elf (and NOT into the bootloader,
+        # since the bootloader is a separate CMake sub-project).
         #
-        # Using build_flags for -lfatfs etc. is WRONG because build_flags maps
-        # to CMAKE_EXE_LINKER_FLAGS which CMake propagates to ALL executable
-        # targets including the bootloader — which does not build fatfs and
-        # therefore fails to link.
+        # DO NOT use cg.add_build_flag with -lfatfs etc. — build_flags maps to
+        # CMAKE_EXE_LINKER_FLAGS which propagates to the bootloader linker and
+        # causes "cannot find -lfatfs" because the bootloader doesn't build fatfs.
         idf_deps = ["fatfs", "sdmmc", "esp_driver_sdmmc"]
-        try:
-            from esphome.components.esp32 import add_idf_component_dependency
+
+        added_via = None
+
+        # Strategy 1: cg.add_idf_component_dependency (ESPHome 2024+, same API
+        #             used by the built-in mdns, bluetooth, etc. components)
+        if hasattr(cg, "add_idf_component_dependency"):
             for dep in idf_deps:
-                add_idf_component_dependency(dep)
-            _LOGGER.info("sd_mmc_card: registered IDF component deps via esp32 module: %s", idf_deps)
-        except (ImportError, AttributeError) as exc:
+                cg.add_idf_component_dependency(dep)
+            added_via = "cg.add_idf_component_dependency"
+
+        # Strategy 2: esphome.components.esp32.add_idf_component_dependency
+        #             (older ESPHome versions, same effect)
+        elif not added_via:
+            try:
+                from esphome.components.esp32 import add_idf_component_dependency as _add_dep
+                for dep in idf_deps:
+                    _add_dep(dep)
+                added_via = "esphome.components.esp32.add_idf_component_dependency"
+            except (ImportError, AttributeError):
+                pass
+
+        if added_via:
+            _LOGGER.info(
+                "sd_mmc_card: registered IDF deps %s via %s", idf_deps, added_via
+            )
+        else:
             _LOGGER.error(
-                "sd_mmc_card: could not register IDF component deps (%s).\n"
-                "  The component will fail to link (undefined references to\n"
-                "  esp_vfs_fat_sdmmc_mount, f_getfree, f_opendir, etc.).\n"
-                "  As a workaround add this to your ESPHome device YAML:\n"
+                "sd_mmc_card: NEITHER cg.add_idf_component_dependency NOR "
+                "esphome.components.esp32.add_idf_component_dependency is available.\n"
+                "  The firmware will fail to link (undefined refs to f_getfree,\n"
+                "  esp_vfs_fat_sdmmc_mount, etc.).\n"
+                "  Workaround: add the following to your device YAML:\n"
                 "    esp32:\n"
                 "      framework:\n"
                 "        type: esp-idf\n"
-                "        # already present — just add under it:\n"
-                "    # (no workaround available without ESPHome esp32 module support)\n"
-                "  ESPHome version may be too old. Reported error: %s",
-                exc, exc,
+                "        advanced:\n"
+                "          ignore_efuse_mac_crc: false  # forces a fresh CMake run\n"
+                "  Then file a bug at https://github.com/KrX3D/waveshare-knob-sdmmc\n"
+                "  with your ESPHome version number."
             )
