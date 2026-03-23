@@ -434,27 +434,34 @@ void SdMmcCard::scan_dir_(const std::string &path, uint8_t depth, std::vector<Fi
 /* ---------- space ---------- */
 
 uint64_t SdMmcCard::total_space() {
-  // FIX: Check f_getfree return value and nullptr before dereferencing fs.
-  //      Use fs->ssize (actual sector size) instead of hardcoded 512 —
-  //      correct for exFAT and 4K-sector cards.
   FATFS *fs = nullptr;
   DWORD free_clust = 0;
   if (f_getfree(FATFS_ROOT, &free_clust, &fs) != FR_OK || fs == nullptr) {
     ESP_LOGE(TAG, "total_space: f_getfree failed");
     return 0;
   }
+  // fs->ssize only exists when FF_MAX_SS != FF_MIN_SS (variable sector size).
+  // IDF 5.x FatFS uses fixed 512-byte sectors (FF_MIN_SS == FF_MAX_SS == 512),
+  // so the ssize field is not present in the FATFS struct.
+#if FF_MAX_SS != FF_MIN_SS
   return (uint64_t) fs->n_fatent * fs->csize * fs->ssize;
+#else
+  return (uint64_t) fs->n_fatent * fs->csize * FF_MIN_SS;
+#endif
 }
 
 uint64_t SdMmcCard::free_space() {
-  // FIX: Same as total_space — guard f_getfree, use fs->ssize
   FATFS *fs = nullptr;
   DWORD free_clust = 0;
   if (f_getfree(FATFS_ROOT, &free_clust, &fs) != FR_OK || fs == nullptr) {
     ESP_LOGE(TAG, "free_space: f_getfree failed");
     return 0;
   }
+#if FF_MAX_SS != FF_MIN_SS
   return (uint64_t) free_clust * fs->csize * fs->ssize;
+#else
+  return (uint64_t) free_clust * fs->csize * FF_MIN_SS;
+#endif
 }
 
 uint64_t SdMmcCard::used_space() {
